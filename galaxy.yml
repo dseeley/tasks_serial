@@ -1,0 +1,32 @@
+namespace: dseeley
+
+name: tasks_serial
+
+version: 0.0.0       # This is automatically filled by Jenkins on galaxy release with the current git release tag number.
+
+readme: README.md
+
+authors:
+- Dougal Seeley <github@dougalseeley.com>
+
+description: An Ansible action plugin to execute tasks serially.
+
+#license:
+#- BSD-3-Clause
+
+license_file: 'LICENSE'
+
+tags: ['system']
+
+dependencies: {}
+
+repository: https://github.com/dseeley/tasks_serial
+
+documentation: https://github.com/dseeley/tasks_serial/blob/master/README.md
+
+homepage: https://github.com/dseeley/tasks_serial
+
+issues: https://github.com/dseeley/tasks_serial/issues
+
+build_ignore: [ '.idea', '.gitignore' ]
+

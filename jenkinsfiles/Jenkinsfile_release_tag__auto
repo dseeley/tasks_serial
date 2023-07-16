@@ -1,0 +1,7 @@
+#!groovy
+
+node {
+    stage('Call ansible/tasks_serial-release-tag') {
+        build job: 'ansible/tasks_serial-release-tag', parameters: [string(name: 'NEW_VERSION', value: "next")]
+    }
+}
