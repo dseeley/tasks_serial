@@ -1,12 +1,14 @@
-# Ansible Collection - dseeley.task_serial
+# Ansible Collection - dseeley.tasks_serial
 
-An Ansible action plugin to execute tasks serially
+An Ansible action plugin to execute tasks serially on each host.
+
+Designed to overcome the limitation described in https://github.com/ansible/ansible/issues/80374
 
 ## Execution
 A successful run:
 ```yaml
-- name: Execute Series of Plugins
-  serial_tasks:
+- name: Execute tasks on all hosts, in series
+  dseeley.tasks_serial.tasks_serial:
     tasks:
       - name: ansible.builtin.debug
         args:
@@ -22,10 +24,10 @@ A successful run:
           cmd: "ls -l"
 ```
 
-A failed run (tasks after the failure do not run)
+A failed run (tasks after the failed task are skipped)
 ```yaml
-- name: Execute Series of Plugins
-  serial_tasks:
+- name: Execute tasks on all hosts, in series
+  dseeley.tasks_serial.tasks_serial:
     tasks:
       - name: ansible.builtin.debug
         args:

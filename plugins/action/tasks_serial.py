@@ -56,7 +56,7 @@ class ActionModule(ActionBase):
 
                     display.v(u"executor: %s" % executor)
 
-                    # Get the action handler for the task using _get_action_handler
+                    # Get the action handler for the task
                     action_handler = executor._get_action_handler(connection=self._connection, templar=self._templar)
                     display.v(u"action_handler: %s" % action_handler)
 
@@ -67,27 +67,8 @@ class ActionModule(ActionBase):
                     task_result = action_handler.run(task_vars=plugin_task_vars)
                     results.append(task_result)
                     display.v(u"action_handler.run - task_result: %s" % task_result)
-
-                    # task_action = self._shared_loader_obj.action_loader.get(new_task.action,
-                    #                                                         task=new_task,
-                    #                                                         connection=self._connection,
-                    #                                                         play_context=self._play_context,
-                    #                                                         loader=self._loader,
-                    #                                                         templar=self._templar,
-                    #                                                         shared_loader_obj=self._shared_loader_obj)
-                    # display.v(u"task_action: %s" % task_action)
-                    # if not task_action:
-                    #     results.append({'failed': True, 'msg': f"Action task '{new_task.action}' not found."})
-                    # else:
-                    #     task_result = task_action.run(task_vars=plugin_task_vars)  # , **new_task.args)
-                    #     display.v(u"task_result: %s" % task_result)
-                    #     results.append(task_result)
-                    #     display.v(u"results: %s" % results)
                 else:
                     results.append({'failed': True, 'msg': f"Task '{new_task.action}' not found."})
-                    # task_result = self._execute_module(module_name=new_task.action, module_args=new_task.args, task_vars=task_vars)
-                    # display.v(u"self._execute_module - task_result: %s" % task_result)
-                    # results.append(task_result)
 
         result['failed'] = True in (('failed' in result and result['failed'] is True) for result in results)
         result['changed'] = True in (('changed' in result and result['changed'] is True) for result in results)
