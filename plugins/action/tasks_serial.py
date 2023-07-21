@@ -1,3 +1,9 @@
+# Copyright 2023 Dougal Seeley <github@dougalseeley.com>
+# BSD 3-Clause License
+
+from __future__ import (absolute_import, division, print_function)
+__metaclass__ = type
+
 from ansible.executor.task_executor import TaskExecutor
 from ansible.plugins.action import ActionBase
 from copy import deepcopy
@@ -17,12 +23,12 @@ class ActionModule(ActionBase):
         result = super(ActionModule, self).run(tmp, task_vars)
         del tmp  # tmp no longer has any effect
 
+        # Initialize the list to store results for each action
+        results = []
+
         tasks = self._task.args.get('tasks', [])
         if not isinstance(tasks, list):
             return {'failed': True, 'msg': 'The "tasks" parameter must be a list.'}
-
-        # Initialize the list to store results for each action
-        results = []
 
         # Execute each task serially
         for task in tasks:
@@ -44,16 +50,23 @@ class ActionModule(ActionBase):
                 in_path = module_loader.find_plugin(new_task.action)
                 display.v(u"in_path: %s" % in_path)
                 if in_path:
-                    executor = TaskExecutor(host=self._play_context.remote_addr,
-                                            task=new_task,
-                                            job_vars={},
-                                            play_context=self._play_context,
-                                            new_stdin={},
-                                            loader=self._loader,
-                                            shared_loader_obj=self._shared_loader_obj,
-                                            final_q=None,
-                                            variable_manager=None)
+                    TaskExecutorArgs = {"host": self._play_context.remote_addr,
+                                        "task": new_task,
+                                        "job_vars": {},
+                                        "play_context": self._play_context,
+                                        "new_stdin": {},
+                                        "loader": self._loader,
+                                        "shared_loader_obj": self._shared_loader_obj,
+                                        "final_q": None}
 
+                    display.v(u"Ansible version: %s" % str(task_vars['ansible_version']))
+                    ansible_version_tuple = (task_vars['ansible_version']['major'], task_vars['ansible_version']['minor'], task_vars['ansible_version']['revision'])
+                    if ansible_version_tuple >= (2, 15, 2):
+                        display.v(u"Ansible version >= 2.15.2 - adding required variable_manager parameter")
+                        TaskExecutorArgs.update({"variable_manager": None})
+
+                    # Create the task executor
+                    executor = TaskExecutor(**TaskExecutorArgs)
                     display.v(u"executor: %s" % executor)
 
                     # Get the action handler for the task
