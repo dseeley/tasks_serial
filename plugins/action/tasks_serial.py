@@ -61,8 +61,8 @@ class ActionModule(ActionBase):
 
                     display.v(u"Ansible version: %s" % str(task_vars['ansible_version']))
                     ansible_version_tuple = (task_vars['ansible_version']['major'], task_vars['ansible_version']['minor'], task_vars['ansible_version']['revision'])
-                    if ansible_version_tuple >= (2, 15, 2):
-                        display.v(u"Ansible version >= 2.15.2 - adding required variable_manager parameter")
+                    if ansible_version_tuple >= (2, 15, 0):
+                        display.v(u"Ansible version >= 2.15.0 - adding required variable_manager parameter")
                         TaskExecutorArgs.update({"variable_manager": None})
 
                     # Create the task executor
