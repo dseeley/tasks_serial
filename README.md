@@ -1,6 +1,8 @@
 # Ansible Collection - dseeley.tasks_serial
 
-An Ansible action plugin to execute tasks serially on each host.
+An Ansible action plugin to execute tasks serially on each host.  Useful, if, for example, you have an HA cluster, and you want to restart each node in turn, and then wait for it to be alive (e.g. by checking a port).  You can't do this by any other mechanism, except declaring the whole play as `serial`, which would slow the whole play down by a factor of the play size.  
+
+To be used in conjunction with `throttle: 1`.  This is a deliberate requirement, so that it is possible to disable the functionality with `throttle: 0` (e.g. conditionally throttling if necessary).
 
 Designed to overcome the limitation described in https://github.com/ansible/ansible/issues/80374
 
@@ -22,6 +24,7 @@ A successful run:
       - name: command
         args:
           cmd: "ls -l"
+  throttle: 1
 ```
 
 A failed run (tasks after the failed task are skipped)
@@ -44,4 +47,5 @@ A failed run (tasks after the failed task are skipped)
       - name: command
         args:
           cmd: "ls -l"
+  throttle: 1
 ```

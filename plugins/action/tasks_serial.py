@@ -2,13 +2,12 @@
 # BSD 3-Clause License
 
 from __future__ import (absolute_import, division, print_function)
+
 __metaclass__ = type
 
-from ansible.executor.task_executor import TaskExecutor
 from ansible.plugins.action import ActionBase
 from copy import deepcopy
 from ansible.utils.display import Display
-from ansible.plugins.loader import module_loader
 from ansible.errors import AnsibleError
 from ansible import constants as C
 
@@ -47,41 +46,22 @@ class ActionModule(ActionBase):
                                                " Please put everything in one or the other place.")
                         new_task.args['_raw_params'] = new_task.args.pop('cmd')
 
-                in_path = module_loader.find_plugin(new_task.action)
-                display.v(u"in_path: %s" % in_path)
-                if in_path:
-                    TaskExecutorArgs = {"host": self._play_context.remote_addr,
-                                        "task": new_task,
-                                        "job_vars": {},
-                                        "play_context": self._play_context,
-                                        "new_stdin": {},
-                                        "loader": self._loader,
-                                        "shared_loader_obj": self._shared_loader_obj,
-                                        "final_q": None}
-
-                    display.v(u"Ansible version: %s" % str(task_vars['ansible_version']))
-                    ansible_version_tuple = (task_vars['ansible_version']['major'], task_vars['ansible_version']['minor'], task_vars['ansible_version']['revision'])
-                    if ansible_version_tuple >= (2, 15, 0):
-                        display.v(u"Ansible version >= 2.15.0 - adding required variable_manager parameter")
-                        TaskExecutorArgs.update({"variable_manager": None})
-
-                    # Create the task executor
-                    executor = TaskExecutor(**TaskExecutorArgs)
-                    display.v(u"executor: %s" % executor)
-
-                    # Get the action handler for the task
-                    action_handler = executor._get_action_handler(connection=self._connection, templar=self._templar)
-                    display.v(u"action_handler: %s" % action_handler)
-
-                    # Create a deep copy of task_vars for each task
-                    plugin_task_vars = deepcopy(task_vars)
-
-                    # Execute the task using the action handler
-                    task_result = action_handler.run(task_vars=plugin_task_vars)
-                    results.append(task_result)
-                    display.v(u"action_handler.run - task_result: %s" % task_result)
+                task_action = self._shared_loader_obj.action_loader.get(new_task.action,
+                                                                        task=new_task,
+                                                                        connection=self._connection,
+                                                                        play_context=self._play_context,
+                                                                        loader=self._loader,
+                                                                        templar=self._templar,
+                                                                        shared_loader_obj=self._shared_loader_obj)
+                display.v(u"task_action: %s" % task_action)
+                if not task_action:
+                    results.append({'failed': True, 'msg': f"Action task '{new_task.action}' not found."})
                 else:
-                    results.append({'failed': True, 'msg': f"Task '{new_task.action}' not found."})
+                    plugin_task_vars = deepcopy(task_vars)  # Create a deep copy of task_vars for each task
+                    task_result = task_action.run(task_vars=plugin_task_vars)
+                    display.vv(u"task_result: %s" % task_result)
+                    results.append(task_result)
+                    display.vv(u"results: %s" % results)
 
         result['failed'] = True in (('failed' in result and result['failed'] is True) for result in results)
         result['changed'] = True in (('changed' in result and result['changed'] is True) for result in results)
