@@ -28,5 +28,5 @@ homepage: https://github.com/dseeley/tasks_serial
 
 issues: https://github.com/dseeley/tasks_serial/issues
 
-build_ignore: [ '.idea', '.gitignore' ]
+build_ignore: [ '.idea', '.gitignore', 'Dockerfile*' ]
 

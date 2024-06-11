@@ -6,10 +6,11 @@ from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
 from ansible.plugins.action import ActionBase
-from copy import deepcopy
 from ansible.utils.display import Display
 from ansible.errors import AnsibleError
 from ansible import constants as C
+from copy import deepcopy
+import traceback
 
 display = Display()
 
@@ -53,14 +54,24 @@ class ActionModule(ActionBase):
                                                                         loader=self._loader,
                                                                         templar=self._templar,
                                                                         shared_loader_obj=self._shared_loader_obj)
-                display.v(u"task_action: %s" % task_action)
+                display.v(f"task_action ({new_task.action}): {task_action}")
+
+                plugin_task_vars = deepcopy(task_vars)  # Create a deep copy of task_vars for each task
                 if not task_action:
-                    results.append({'failed': True, 'msg': f"Action task '{new_task.action}' not found."})
+                    # Try running as a module instead of an action
+                    try:
+                        _execute_module_result = self._execute_module(module_name=new_task.action, module_args=new_task.args, task_vars=plugin_task_vars)
+                        display.v(f"self._execute_module ({new_task.action}): {_execute_module_result}")
+                    except Exception:
+                        display.error(f"self._execute_module ({new_task.action}): {traceback.format_exc()}")
+                    if _execute_module_result:
+                        results.append(_execute_module_result)
+                    else:
+                        results.append({'failed': True, 'msg': f"'{new_task.action}' not found as an Action or Module"})
                 else:
-                    plugin_task_vars = deepcopy(task_vars)  # Create a deep copy of task_vars for each task
-                    task_result = task_action.run(task_vars=plugin_task_vars)
-                    display.vv(u"task_result: %s" % task_result)
-                    results.append(task_result)
+                    task_action_result = task_action.run(task_vars=plugin_task_vars)
+                    display.vv(u"task_action_result: %s" % task_action_result)
+                    results.append(task_action_result)
                     display.vv(u"results: %s" % results)
 
         result['failed'] = True in (('failed' in result and result['failed'] is True) for result in results)

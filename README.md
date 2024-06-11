@@ -15,13 +15,18 @@ A successful run:
       - name: ansible.builtin.debug
         args:
           msg: "Task 1 - debug!"
-      - name: ansible.builtin.debug
+      - name: debug
         args:
           msg: "Task 2 - debug!"
       - name: ansible.builtin.shell
         args:
           cmd: echo "Task 3 - shell echo"
-      - name: command
+      - name: ansible.builtin.wait_for
+        args:
+          host: localhost
+          port: 22
+          timeout: 5
+      - name: ansible.builtin.command
         args:
           cmd: "ls -l"
   throttle: 1
@@ -35,7 +40,7 @@ A failed run (tasks after the failed task are skipped)
       - name: ansible.builtin.debug
         args:
           msg: "Task 1 - debug!"
-      - name: command
+      - name: ansible.builtin.command
         args:
           cmd: "/bin/false"
       - name: ansible.builtin.debug
