@@ -1,0 +1,206 @@
+---
+- name: tasks_serial | basic serial execution
+  hosts: local
+  gather_facts: false
+  tasks:
+    - name: run a short sequence of nested tasks
+      dseeley.tasks_serial.tasks_serial:
+        tasks:
+          - name: first debug
+            ansible.builtin.debug:
+              msg: first
+          - name: second debug
+            ansible.builtin.debug:
+              msg: second
+      throttle: 1
+      register: r__basic
+
+    - name: verify basic serial execution succeeded
+      ansible.builtin.assert:
+        that:
+          - not r__basic.failed | default(true)
+          - r__basic.results | length == 2
+          - r__basic.results[0].msg == 'first'
+          - r__basic.results[1].msg == 'second'
+
+- name: tasks_serial | with_items loop with templated item
+  hosts: local
+  gather_facts: false
+  vars:
+    test_items:
+      - alpha
+      - beta
+  tasks:
+    - name: loop over items inside nested tasks
+      dseeley.tasks_serial.tasks_serial:
+        tasks:
+          - name: debug each item
+            ansible.builtin.debug:
+              msg: "change_master_config ADD_SERVER {{ item }}"
+            with_items: "{{ test_items }}"
+      throttle: 1
+      register: r__loop
+
+    - name: verify with_items loop results
+      ansible.builtin.assert:
+        that:
+          - not r__loop.failed | default(true)
+          - r__loop.results | length == 1
+          - r__loop.results[0].results | length == 2
+          - r__loop.results[0].results[0].item == 'alpha'
+          - r__loop.results[0].results[0].msg == 'change_master_config ADD_SERVER alpha'
+          - r__loop.results[0].results[1].item == 'beta'
+          - r__loop.results[0].results[1].msg == 'change_master_config ADD_SERVER beta'
+
+- name: tasks_serial | loop keyword and when
+  hosts: local
+  gather_facts: false
+  tasks:
+    - name: run loop with per-item when condition
+      dseeley.tasks_serial.tasks_serial:
+        tasks:
+          - name: only emit beta
+            ansible.builtin.debug:
+              msg: "seen {{ item }}"
+            when: item == 'beta'
+            loop:
+              - alpha
+              - beta
+      throttle: 1
+      register: r__when
+
+    - name: verify loop and when results
+      ansible.builtin.assert:
+        that:
+          - not r__when.failed | default(true)
+          - r__when.results[0].results | length == 2
+          - r__when.results[0].results[0].skipped | default(false)
+          - r__when.results[0].results[1].msg == 'seen beta'
+
+- name: tasks_serial | register persistence and until retries
+  hosts: local
+  gather_facts: false
+  tasks:
+    - name: register and until across nested tasks
+      dseeley.tasks_serial.tasks_serial:
+        tasks:
+          - name: register a value for later nested tasks
+            ansible.builtin.debug:
+              msg: registered
+            register: r__nested_first
+
+          - name: consume a prior nested register
+            ansible.builtin.assert:
+              that:
+                - r__nested_first is defined
+                - r__nested_first.msg == 'registered'
+
+          - name: retry until the expected response is seen
+            ansible.builtin.debug:
+              msg: polled
+            register: r__retry
+            until: r__retry.msg == 'polled'
+            retries: 3
+            delay: 0
+      throttle: 1
+      register: r__retry_block
+
+    - name: verify register persistence and until retries
+      ansible.builtin.assert:
+        that:
+          - not r__retry_block.failed | default(true)
+          - r__retry_block.results | length == 3
+          - r__retry_block.results[2].attempts == 1
+          - r__retry_block.results[2].msg == 'polled'
+
+- name: tasks_serial | HA pattern add each item then wait per item
+  hosts: local
+  gather_facts: false
+  vars:
+    nodes_to_add:
+      - node_a
+      - node_b
+  tasks:
+    - name: simulate add-then-wait cluster rollout per node
+      dseeley.tasks_serial.tasks_serial:
+        tasks:
+          - name: add node to cluster state
+            ansible.builtin.set_fact:
+              cluster_masters: "{{ (cluster_masters | default([])) + [item] }}"
+            loop: "{{ nodes_to_add }}"
+
+          - name: wait until node is present in cluster state
+            ansible.builtin.assert:
+              that:
+                - item in cluster_masters
+            register: r__wait_master
+            until: not r__wait_master.failed
+            retries: 3
+            delay: 0
+            loop: "{{ nodes_to_add }}"
+      throttle: 1
+      register: r__ha
+
+    - name: verify HA add-then-wait pattern
+      ansible.builtin.assert:
+        that:
+          - not r__ha.failed | default(true)
+          - r__ha.results | length == 2
+          - r__ha.results[0].results | length == 2
+          - r__ha.results[1].results | length == 2
+          - r__ha.results[1].results[0].attempts == 1
+          - r__ha.results[1].results[1].attempts == 1
+
+- name: tasks_serial | fail-fast skips subsequent nested tasks
+  hosts: local
+  gather_facts: false
+  tasks:
+    - name: run a failing nested sequence
+      dseeley.tasks_serial.tasks_serial:
+        tasks:
+          - name: succeeds
+            ansible.builtin.debug:
+              msg: ok
+          - name: fails
+            ansible.builtin.command:
+              cmd: /bin/false
+          - name: should be skipped
+            ansible.builtin.debug:
+              msg: skipped
+      throttle: 1
+      register: r__failfast
+      ignore_errors: true
+
+    - name: verify fail-fast behaviour
+      ansible.builtin.assert:
+        that:
+          - r__failfast.failed
+          - r__failfast.results | length == 3
+          - not r__failfast.results[0].failed | default(true)
+          - r__failfast.results[1].failed
+          - r__failfast.results[2].skipped | default(false)
+
+- name: tasks_serial | multiple hosts with throttle
+  hosts: serial_hosts
+  gather_facts: false
+  tasks:
+    - name: run nested tasks on each host with throttle
+      dseeley.tasks_serial.tasks_serial:
+        tasks:
+          - name: identify host
+            ansible.builtin.debug:
+              msg: "host={{ inventory_hostname }}"
+            register: r__host_marker
+
+          - name: verify register is visible to the next nested task
+            ansible.builtin.assert:
+              that:
+                - inventory_hostname in r__host_marker.msg
+      throttle: 1
+      register: r__multihost
+
+    - name: verify nested tasks completed on this host
+      ansible.builtin.assert:
+        that:
+          - not r__multihost.failed | default(true)
+          - r__multihost.results | length == 2

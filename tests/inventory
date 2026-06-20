@@ -1,0 +1,6 @@
+[local]
+localhost ansible_connection=local
+
+[serial_hosts]
+serial_a ansible_connection=local
+serial_b ansible_connection=local
