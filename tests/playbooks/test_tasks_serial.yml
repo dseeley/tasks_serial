@@ -77,6 +77,65 @@
           - r__when.results[0].results[0].skipped | default(false)
           - r__when.results[0].results[1].msg == 'seen beta'
 
+# Plausible inner with_items pattern: quiesce every local replica, perform one
+# maintenance action, then verify each replica is healthy again.  The with_items
+# loops live on nested tasks; tasks_serial still runs those task blocks in order.
+- name: tasks_serial | inner with_items quiesce replicas then restart
+  hosts: local
+  gather_facts: false
+  vars:
+    local_replicas:
+      - replica_a
+      - replica_b
+      - replica_c
+  tasks:
+    - name: quiesce replicas, restart service, and verify health
+      dseeley.tasks_serial.tasks_serial:
+        tasks:
+          - name: quiesce replica {{ item }}
+            ansible.builtin.set_fact:
+              quiesced_replicas: "{{ (ansible_facts.quiesced_replicas | default(quiesced_replicas | default([]))) + [item] }}"
+            with_items: "{{ local_replicas }}"
+
+          - name: wait until replica {{ item }} is quiesced
+            ansible.builtin.assert:
+              that:
+                - item in (ansible_facts.quiesced_replicas | default(quiesced_replicas | default([])))
+            register: r__quiesce_wait
+            until: not r__quiesce_wait.failed
+            retries: 3
+            delay: 0
+            with_items: "{{ local_replicas }}"
+
+          - name: restart local service once all replicas are quiesced
+            ansible.builtin.set_fact:
+              service_restarted: true
+
+          - name: wait until replica {{ item }} is healthy after restart
+            ansible.builtin.assert:
+              that:
+                - service_restarted | default(false)
+            register: r__health_wait
+            until: not r__health_wait.failed
+            retries: 3
+            delay: 0
+            with_items: "{{ local_replicas }}"
+      throttle: 1
+      register: r__inner_with_items
+
+    - name: verify inner with_items quiesce and restart pattern
+      ansible.builtin.assert:
+        that:
+          - not r__inner_with_items.failed | default(true)
+          - r__inner_with_items.results | length == 4
+          - r__inner_with_items.results[0].results | length == 3
+          - r__inner_with_items.results[0].results | map(attribute='item') | list == local_replicas
+          - r__inner_with_items.results[1].results | length == 3
+          - r__inner_with_items.results[1].results | map(attribute='attempts') | list == [1, 1, 1]
+          - r__inner_with_items.results[2].ansible_facts.service_restarted | default(false)
+          - r__inner_with_items.results[3].results | length == 3
+          - r__inner_with_items.ansible_facts.quiesced_replicas == local_replicas
+
 - name: tasks_serial | register persistence and until retries
   hosts: local
   gather_facts: false
@@ -113,7 +172,10 @@
           - r__retry_block.results[2].attempts == 1
           - r__retry_block.results[2].msg == 'polled'
 
-- name: tasks_serial | HA pattern add each item then wait per item
+# Simulate HA cluster rollout: add one node, wait for it, then add the next.
+# loop belongs on the outer tasks_serial task (not on nested tasks) so each
+# iteration completes add-then-wait before the next node is processed.
+- name: tasks_serial | HA pattern add then wait per node via outer loop
   hosts: local
   gather_facts: false
   vars:
@@ -124,36 +186,54 @@
     - name: simulate add-then-wait cluster rollout per node
       dseeley.tasks_serial.tasks_serial:
         tasks:
-          - name: add node to cluster state
+          # Read prior state from ansible_facts so facts set in earlier outer-loop
+          # iterations are visible (bare variable names are not always injected).
+          - name: add node {{ item }} to cluster state
             ansible.builtin.set_fact:
-              cluster_masters: "{{ (cluster_masters | default([])) + [item] }}"
-            loop: "{{ nodes_to_add }}"
+              cluster_masters: "{{ (ansible_facts.cluster_masters | default(cluster_masters | default([]))) + [item] }}"
+              rollout_log: "{{ (ansible_facts.rollout_log | default(rollout_log | default([]))) + ['add:' + item] }}"
 
-          - name: wait until node is present in cluster state
+          - name: wait until node {{ item }} is present in cluster state
             ansible.builtin.assert:
               that:
-                - item in cluster_masters
+                - item in (ansible_facts.cluster_masters | default(cluster_masters | default([])))
             register: r__wait_master
             until: not r__wait_master.failed
             retries: 3
             delay: 0
-            loop: "{{ nodes_to_add }}"
+
+          # Append to rollout_log so assertions can verify add/wait ordering.
+          - name: record wait completion for node {{ item }}
+            ansible.builtin.set_fact:
+              rollout_log: "{{ (ansible_facts.rollout_log | default(rollout_log | default([]))) + ['wait:' + item] }}"
+      loop: "{{ nodes_to_add }}"
       throttle: 1
       register: r__ha
 
-    - name: verify HA add-then-wait pattern
+    - name: verify per-node add-then-wait ordering
       ansible.builtin.assert:
         that:
-          - not r__ha.failed | default(true)
+          # One plugin result per outer-loop iteration.
           - r__ha.results | length == 2
-          - r__ha.results[0].results | length == 2
-          - r__ha.results[1].results | length == 2
-          - r__ha.results[1].results[0].attempts == 1
+          - r__ha.results | selectattr('failed', 'defined') | selectattr('failed') | list | length == 0
+          - r__ha.results[0].results | length == 3
+          - r__ha.results[1].results | length == 3
+          - r__ha.results[0].item == 'node_a'
+          - r__ha.results[1].item == 'node_b'
+          - r__ha.results[0].results[1].attempts == 1
           - r__ha.results[1].results[1].attempts == 1
+          # Facts bubble up to each outer-loop iteration's plugin result.
+          - r__ha.results[0].ansible_facts.cluster_masters == ['node_a']
+          - r__ha.results[0].ansible_facts.rollout_log == ['add:node_a', 'wait:node_a']
+          - r__ha.results[1].ansible_facts.cluster_masters == ['node_a', 'node_b']
+          - r__ha.results[1].ansible_facts.rollout_log == ['add:node_a', 'wait:node_a', 'add:node_b', 'wait:node_b']
 
 - name: tasks_serial | fail-fast skips subsequent nested tasks
   hosts: local
   gather_facts: false
+  # command needs a working connection; inventory deliberately omits ansible_connection=local.
+  vars:
+    ansible_connection: local
   tasks:
     - name: run a failing nested sequence
       dseeley.tasks_serial.tasks_serial:
@@ -183,6 +263,8 @@
 - name: tasks_serial | multiple hosts with throttle
   hosts: serial_hosts
   gather_facts: false
+  vars:
+    ansible_connection: local
   tasks:
     - name: run nested tasks on each host with throttle
       dseeley.tasks_serial.tasks_serial:

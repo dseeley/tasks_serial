@@ -18,6 +18,7 @@ from ansible.module_utils.common.text.converters import to_text
 from ansible.playbook.attribute import NonInheritableFieldAttribute
 from ansible.playbook.task import Task
 from ansible.plugins.action import ActionBase
+from ansible.plugins.connection import ConnectionBase
 from ansible._internal._templating._engine import TemplateEngine
 from ansible.utils.display import Display
 from ansible.utils.vars import get_unique_id
@@ -70,7 +71,7 @@ class ActionModule(ActionBase):
 
         # Shared across all nested tasks on this host so register/facts from an earlier nested
         # task are visible to later ones (mirrors behaviour within a normal play).
-        plugin_task_vars = deepcopy(task_vars)
+        plugin_task_vars = self._prepare_nested_task_vars(deepcopy(task_vars))
         host = Host(plugin_task_vars.get('inventory_hostname', self._play_context.remote_addr))
         variable_manager = self._get_variable_manager()
 
@@ -103,8 +104,7 @@ class ActionModule(ActionBase):
 
             # TaskExecutor updates an internal copy of variables; push results back into
             # plugin_task_vars so subsequent nested tasks can use register/ set_fact values.
-            self._apply_register_vars(nested_task, task_result, plugin_task_vars)
-            self._apply_fact_vars(task_result, plugin_task_vars)
+            self._update_task_vars(nested_task, task_result, plugin_task_vars)
             results.append(task_result)
 
         result['failed'] = self._results_failed(results)
@@ -112,56 +112,79 @@ class ActionModule(ActionBase):
         result['_ansible_verbose_always'] = True
         result['results'] = results
 
+        # Bubble nested set_fact results up to the plugin result so Ansible can
+        # persist them on the host between outer-loop iterations of tasks_serial.
+        ansible_facts = self._collect_ansible_facts(results)
+        if ansible_facts:
+            result['ansible_facts'] = ansible_facts
+
         return result
 
     def _execute_nested_task(self, nested_task, host, task_vars, variable_manager):
+        # TaskExecutor mutates play_context.connection in place.  Use a per-nested-task
+        # copy and normalize the connection name so remote hosts do not inherit an
+        # unresolvable plugin path left behind by earlier executor runs.
+        play_context = self._play_context.copy()
+        connection = self._resolve_nested_connection(task_vars, nested_task, play_context)
+        if connection:
+            play_context.connection = connection
+            nested_task.connection = connection
+
         executor_kwargs = {
             'host': host,
-            'play_context': self._play_context,
+            'play_context': play_context,
             'loader': self._loader,
             'shared_loader_obj': self._shared_loader_obj,
             'final_q': _NoopFinalQueue(),
             'variable_manager': variable_manager,
         }
 
+        # Reuse the connection that already works for this tasks_serial invocation.
+        parent_connection = getattr(self, '_connection', None)
+        parent_play_context = getattr(parent_connection, '_play_context', None)
+        reuse_connection = (
+            isinstance(parent_connection, ConnectionBase)
+            and getattr(parent_connection, 'connected', False)
+            and parent_play_context is not None
+            and play_context.remote_addr == parent_play_context.remote_addr
+        )
+
         if _TASK_EXECUTOR_USES_TASK_CONTEXT:
             # Ansible 14+: task and variables live in TaskContext for the duration of run().
             from ansible._internal._task import TaskContext
+
+            executor = TaskExecutor(**executor_kwargs)
+            if reuse_connection:
+                executor._connection = parent_connection
 
             with TaskContext.create(
                 task=nested_task,
                 task_vars=task_vars,
                 host_name=host.get_name(),
             ):
-                return TaskExecutor(**executor_kwargs).run().as_result_dict()
+                return executor.run().as_result_dict()
 
         # Ansible 12–13: pass task and job_vars directly to TaskExecutor.
-        return TaskExecutor(task=nested_task, job_vars=task_vars, **executor_kwargs).run()
+        executor = TaskExecutor(task=nested_task, job_vars=task_vars, **executor_kwargs)
+        if reuse_connection:
+            executor._connection = parent_connection
+        return executor.run()
 
     @staticmethod
-    def _apply_register_vars(nested_task, task_result, task_vars):
+    def _update_task_vars(nested_task, task_result, task_vars):
         register = nested_task.register
-        if not register:
-            return
+        if register:
+            # register is a plain string on Ansible 12–13 and a dict on Ansible 14+.
+            if isinstance(register, dict):
+                for var_name in register:
+                    task_vars[var_name] = task_result
+            else:
+                task_vars[register] = task_result
 
-        # register is a plain string on Ansible 12–13 and a dict on Ansible 14+.
-        if isinstance(register, dict):
-            for var_name in register:
-                task_vars[var_name] = task_result
-        else:
-            task_vars[register] = task_result
-
-    @staticmethod
-    def _apply_fact_vars(task_result, task_vars):
         ansible_facts = task_result.get('ansible_facts')
-        if not ansible_facts:
-            return
-
-        task_vars.update(ansible_facts)
-        if 'ansible_facts' in task_vars:
-            task_vars['ansible_facts'].update(ansible_facts)
-        else:
-            task_vars['ansible_facts'] = ansible_facts
+        if ansible_facts:
+            task_vars.update(ansible_facts)
+            task_vars.setdefault('ansible_facts', {}).update(ansible_facts)
 
     def _get_variable_manager(self):
         try:
@@ -202,6 +225,67 @@ class ActionModule(ActionBase):
         nested_task.name = parsed_task.name
         nested_task._resolved_action = parsed_task._resolved_action
         return nested_task
+
+    def _prepare_nested_task_vars(self, task_vars):
+        # Ansible 12–14 rewrite ansible_connection between outer-loop iterations,
+        # sometimes to an internal plugin path that connection_loader cannot resolve.
+        connection = self._normalize_connection_name(task_vars.get('ansible_connection'))
+        if connection is None:
+            connection = self._normalize_connection_name(self._play_context.connection)
+        if connection:
+            task_vars['ansible_connection'] = connection
+        return task_vars
+
+    @staticmethod
+    def _normalize_connection_name(connection):
+        if connection is None or connection is Sentinel:
+            return None
+
+        connection = to_text(connection)
+
+        # TaskExecutor can record fully-qualified plugin paths on the task after
+        # the first nested run; reduce those back to a loader-friendly name.
+        if 'plugins.connection.' in connection:
+            return connection.rsplit('.', 1)[-1]
+        if connection.startswith('ansible.builtin.'):
+            return connection.split('.', 2)[-1]
+        if connection.startswith('ansible.legacy.'):
+            return connection.removeprefix('ansible.legacy.')
+
+        return connection
+
+    @staticmethod
+    def _resolve_nested_connection(task_vars, nested_task, play_context):
+        """Return a short connection plugin name that connection_loader can resolve."""
+        candidates = (
+            task_vars.get('ansible_connection'),
+            getattr(nested_task, 'connection', None),
+            getattr(play_context, 'connection', None),
+        )
+
+        for candidate in candidates:
+            connection = ActionModule._normalize_connection_name(candidate)
+            if connection:
+                return connection
+
+        return None
+
+    @staticmethod
+    def _collect_ansible_facts(results):
+        """Merge ansible_facts from nested tasks (including loop sub-results)."""
+        ansible_facts = {}
+
+        for task_result in results:
+            facts = task_result.get('ansible_facts')
+            if facts:
+                ansible_facts.update(facts)
+
+            for loop_result in task_result.get('results', []):
+                facts = loop_result.get('ansible_facts')
+                if facts:
+                    ansible_facts.update(facts)
+
+        return ansible_facts
 
     @staticmethod
     def _results_failed(results):

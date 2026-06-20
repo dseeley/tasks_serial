@@ -35,6 +35,8 @@ Each entry in the `tasks` list is a normal Ansible task.  Directives such as `lo
 
 `register` results and facts from one nested task are visible to subsequent nested tasks within the same `tasks_serial` invocation on the same host.
 
+Nested tasks on remote hosts reuse the outer task's SSH (or other) connection.  When updating cumulative state across an outer `loop`, read prior values from `ansible_facts` (see the HA example below).  Between outer-loop iterations Ansible may rewrite `ansible_connection` to an internal plugin path; `tasks_serial` normalizes that before running nested tasks.
+
 ### Loop variables and `{{ item }}`
 
 The `tasks` argument is not templated when the outer task is parsed.  Expressions such as `{{ item }}` inside nested tasks are evaluated later, when each nested task runs.
@@ -123,21 +125,20 @@ A failed run (tasks after the failed task are skipped):
 
 ### Loops, retries, and register
 
-A typical HA cluster pattern — perform an action for each item, then wait until a condition is met before moving to the next host:
+A typical HA cluster pattern — add each node, wait for it to be healthy, then move on to the next node.  Put `loop` on the **outer** `tasks_serial` task so each iteration runs the full add-then-wait pair before the next node is processed.  Use `throttle: 1` so only one host performs this rollout at a time.
 
 ```yaml
-- name: Add and wait for new masters serially
+- name: Add and wait for each new master serially
   dseeley.tasks_serial.tasks_serial:
     tasks:
-      - name: Add new master nodes
+      - name: Add new master node {{ item }}
         ansible.builtin.shell:
           cmd: >-
             {{ yb_home }}/bin/yb-admin --certs_dir={{ yb_certdir }}
             --master_addresses {{ master_addresses }}
             change_master_config ADD_SERVER {{ hostvars[item]['ansible_facts']['default_ipv4']['address'] }} 7100
-        with_items: "{{ nodes_to_add }}"
 
-      - name: Wait until new master is present
+      - name: Wait until new master {{ item }} is present
         ansible.builtin.uri:
           url: "http://localhost:7000/api/v1/masters"
           method: GET
@@ -151,7 +152,7 @@ A typical HA cluster pattern — perform an action for each item, then wait unti
           item in ((r__uri__masters.content | from_json).masters | json_query('[].registration.http_addresses[].host'))
         retries: 60
         delay: 1
-        with_items: "{{ nodes_to_add }}"
+  loop: "{{ nodes_to_add }}"
   throttle: 1
   become: true
 ```
