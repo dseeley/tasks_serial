@@ -260,6 +260,305 @@
           - r__failfast.results[1].failed
           - r__failfast.results[2].skipped | default(false)
 
+# Outer task delegate_to must not bleed into nested tasks that omit delegation.
+- name: tasks_serial | outer delegate_to must not inherit into nested tasks
+  hosts: serial_a
+  gather_facts: false
+  vars:
+    ansible_connection: local
+  tasks:
+    - name: seed distinct per-host IPs
+      ansible.builtin.set_fact:
+        ansible_facts: "{{ ansible_facts | default({}) | combine({'default_ipv4': {'address': '10.0.0.1'}}) }}"
+        cacheable: true
+
+    - name: seed peer IP on serial_b
+      ansible.builtin.set_fact:
+        ansible_facts: "{{ ansible_facts | default({}) | combine({'default_ipv4': {'address': '10.0.0.2'}}) }}"
+        cacheable: true
+      delegate_to: serial_b
+      delegate_facts: true
+
+    - name: nested tasks run on inventory host even when outer task is delegated
+      dseeley.tasks_serial.tasks_serial:
+        tasks:
+          - name: capture inventory host IP from nested context
+            ansible.builtin.set_fact:
+              nested_ip: "{{ ansible_facts.default_ipv4.address }}"
+
+          - name: read peer IP via hostvars
+            ansible.builtin.set_fact:
+              peer_ip: "{{ hostvars['serial_b']['ansible_facts']['default_ipv4']['address'] }}"
+      delegate_to: serial_b
+      throttle: 1
+      register: r__outer_delegate
+
+    - name: verify nested context stayed on inventory host
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.default_ipv4.address == '10.0.0.1'
+          - r__outer_delegate.ansible_facts.nested_ip == '10.0.0.1'
+          - r__outer_delegate.ansible_facts.peer_ip == '10.0.0.2'
+          - r__outer_delegate.ansible_facts.ansible_default_ipv4 is not defined
+
+# HA README pattern: nested loop reads each node's IP via hostvars[item].
+- name: tasks_serial | hostvars node IP lookup must stay per host
+  hosts: serial_hosts
+  gather_facts: false
+  vars:
+    ansible_connection: local
+    nodes_to_add:
+      - serial_a
+      - serial_b
+  tasks:
+    - name: seed distinct per-host IPs
+      ansible.builtin.set_fact:
+        ansible_facts: "{{ ansible_facts | default({}) | combine({'default_ipv4': {'address': ('10.0.0.1' if inventory_hostname == 'serial_a' else '10.0.0.2')}}) }}"
+        cacheable: true
+
+    - name: nested hostvars IP lookup per node
+      dseeley.tasks_serial.tasks_serial:
+        tasks:
+          - name: record node IP from hostvars
+            ansible.builtin.set_fact:
+              seen_ips: "{{ (ansible_facts.seen_ips | default(seen_ips | default({}))) | combine({item: hostvars[item]['ansible_facts']['default_ipv4']['address']}) }}"
+            loop: "{{ nodes_to_add }}"
+      throttle: 1
+      register: r__node_ips
+
+    - name: verify node IPs are not swapped across hosts
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.default_ipv4.address == ('10.0.0.1' if inventory_hostname == 'serial_a' else '10.0.0.2')
+          - seen_ips.serial_a == '10.0.0.1'
+          - seen_ips.serial_b == '10.0.0.2'
+          - r__node_ips.ansible_facts.seen_ips.serial_a == '10.0.0.1'
+          - r__node_ips.ansible_facts.seen_ips.serial_b == '10.0.0.2'
+
+# Nested delegate_to + delegate_facts must not merge the delegated host's facts
+# onto the current host.  Without this guard, host A can render host B's IP.
+- name: tasks_serial | delegate_facts must not leak to current host
+  hosts: serial_hosts
+  gather_facts: false
+  vars:
+    ansible_connection: local
+  tasks:
+    - name: set per-host identity marker
+      ansible.builtin.set_fact:
+        host_identity: "{{ inventory_hostname }}"
+
+    - name: nested delegate_facts set_fact on peer host
+      dseeley.tasks_serial.tasks_serial:
+        tasks:
+          - name: record this host's identity on delegated peer
+            ansible.builtin.set_fact:
+              peer_identity: "{{ host_identity }}"
+            delegate_to: "{{ peer_host }}"
+            delegate_facts: true
+
+          # A follow-on nested task must read the delegated fact from the peer
+          # host, not from the current host (the leak that caused wrong IPs).
+          - name: verify delegated peer identity is visible via hostvars
+            ansible.builtin.assert:
+              that:
+                - hostvars[peer_host]['peer_identity'] | default('') == host_identity
+      vars:
+        peer_host: "{{ 'serial_b' if inventory_hostname == 'serial_a' else 'serial_a' }}"
+      throttle: 1
+      register: r__delegate_facts
+
+    - name: verify delegated facts did not leak onto the current host
+      ansible.builtin.assert:
+        that:
+          - host_identity == inventory_hostname
+          - peer_identity is not defined
+          - r__delegate_facts.ansible_facts.peer_identity is not defined
+
+# Outer with_items + nested delegate_to must not carry discovered interpreters
+# between delegate targets or outer-loop iterations (wrong python3.14 errors).
+- name: tasks_serial | outer with_items nested delegate_to interpreter isolation
+  hosts: local
+  gather_facts: false
+  vars:
+    ansible_connection: local
+    redeploy_targets:
+      - name: serial_a
+      - name: serial_b
+  tasks:
+    - name: simulate interpreter pollution from a prior outer-loop iteration
+      ansible.builtin.set_fact:
+        discovered_interpreter_python: /usr/bin/python3.14
+
+    - name: nested delegated commands across outer with_items targets
+      dseeley.tasks_serial.tasks_serial:
+        tasks:
+          - name: stop service on delegated target
+            ansible.builtin.command:
+              cmd: /bin/true
+            delegate_to: "{{ item.name }}"
+            become: true
+      with_items: "{{ redeploy_targets }}"
+      register: r__outer_delegate_loop
+
+    - name: two nested delegate_to targets in one block must both succeed
+      dseeley.tasks_serial.tasks_serial:
+        tasks:
+          - name: command on serial_a
+            ansible.builtin.command:
+              cmd: /bin/true
+            delegate_to: serial_a
+            become: true
+
+          - name: command on serial_b
+            ansible.builtin.command:
+              cmd: /bin/true
+            delegate_to: serial_b
+            become: true
+      register: r__multi_delegate
+
+    - name: verify interpreter facts were not bubbled or retained
+      ansible.builtin.assert:
+        that:
+          - r__outer_delegate_loop.results | length == 2
+          - r__outer_delegate_loop.results[0].ansible_facts.discovered_interpreter_python is not defined
+          - r__outer_delegate_loop.results[1].ansible_facts.discovered_interpreter_python is not defined
+          - not r__outer_delegate_loop.results[0].failed | default(true)
+          - not r__outer_delegate_loop.results[1].failed | default(true)
+          - "'python3.14' not in (r__outer_delegate_loop.results[0].results[0].msg | default(''))"
+          - "'python3.14' not in (r__outer_delegate_loop.results[1].results[0].msg | default(''))"
+          - not r__multi_delegate.failed | default(true)
+          - r__multi_delegate.results | selectattr('failed', 'defined') | selectattr('failed') | list | length == 0
+          - "'python3.14' not in (r__multi_delegate.results[0].msg | default(''))"
+          - "'python3.14' not in (r__multi_delegate.results[1].msg | default(''))"
+
+# Nested until + delegate_to must retry on the delegated host (register visible
+# to the until expression on every attempt).
+- name: tasks_serial | nested until retries on delegated host
+  hosts: local
+  gather_facts: false
+  vars:
+    ansible_connection: local
+  tasks:
+    - name: nested delegated until must retry until condition is met
+      dseeley.tasks_serial.tasks_serial:
+        tasks:
+          - name: increment counter until ready on delegated host
+            ansible.builtin.shell: |
+              C=/tmp/tasks_serial_until_{{ inventory_hostname }}
+              n=$(cat "$C" 2>/dev/null || echo 0)
+              echo $((n + 1)) > "$C"
+              cat "$C"
+            delegate_to: serial_a
+            register: r__until_delegate
+            until: (r__until_delegate.stdout | trim | int) >= 2
+            retries: 5
+            delay: 0
+      throttle: 1
+      register: r__until_delegate_block
+
+    - name: verify delegated until retried and eventually succeeded
+      ansible.builtin.assert:
+        that:
+          - not r__until_delegate_block.failed | default(true)
+          - r__until_delegate_block.results | length == 1
+          - r__until_delegate_block.results[0].attempts | int >= 2
+          - r__until_delegate_block.results[0].stdout | trim | int >= 2
+          - r__until_delegate_block.results[0]._ansible_delegated_host == 'serial_a'
+
+# localhost plays with ansible_connection: local are common for cloud-driven loops.
+# Nested delegate_to must not inherit that connection from the outer tasks_serial task.
+- name: tasks_serial | localhost outer loop nested delegate_to must not stay local
+  hosts: local
+  gather_facts: false
+  vars:
+    ansible_connection: local
+    redeploy_targets:
+      - name: serial_ssh
+  tasks:
+    - name: nested delegated command from localhost across outer with_items
+      dseeley.tasks_serial.tasks_serial:
+        tasks:
+          - name: run on delegated target
+            ansible.builtin.command:
+              cmd: /bin/true
+            delegate_to: "{{ item.name }}"
+            ignore_errors: true
+            ignore_unreachable: true
+      with_items: "{{ redeploy_targets }}"
+      throttle: 1
+      register: r__localhost_delegate_connection
+
+    - name: verify localhost play delegated over SSH not local connection
+      ansible.builtin.assert:
+        that:
+          - r__localhost_delegate_connection.results | length == 1
+          - r__localhost_delegate_connection.results[0].results[0].unreachable | default(false)
+          - "'ssh:' in r__localhost_delegate_connection.results[0].results[0].msg"
+          - r__localhost_delegate_connection.results[0].results[0]._ansible_delegated_host == 'serial_ssh'
+
+# HA redeploy pattern: outer with_items + nested delegate_to must reach each target's
+# connection settings (not the inventory host's local connection).
+- name: tasks_serial | outer with_items nested delegate_to uses target connection
+  hosts: serial_a
+  gather_facts: false
+  vars:
+    redeploy_targets:
+      - name: serial_ssh
+  tasks:
+    - name: nested delegated command across outer with_items
+      dseeley.tasks_serial.tasks_serial:
+        tasks:
+          - name: run on delegated target
+            ansible.builtin.command:
+              cmd: /bin/true
+            delegate_to: "{{ item.name }}"
+            ignore_errors: true
+            ignore_unreachable: true
+      with_items: "{{ redeploy_targets }}"
+      throttle: 1
+      register: r__delegate_connection
+
+    - name: verify delegated host SSH connection was attempted
+      ansible.builtin.assert:
+        that:
+          - r__delegate_connection.results | length == 1
+          - r__delegate_connection.results[0].results[0].unreachable | default(false)
+          - "'ssh:' in r__delegate_connection.results[0].results[0].msg"
+
+# ansible.builtin.service reports ": host" when init-system tooling cannot be detected
+# on the machine where the module actually ran (not because delegate_to resolved to
+# a host literally named "host").
+- name: tasks_serial | nested service delegate_to surfaces service module errors
+  hosts: local
+  gather_facts: false
+  vars:
+    ansible_connection: local
+    redeploy_targets:
+      - name: serial_a
+      - name: serial_b
+  tasks:
+    - name: nested delegated service stop across outer with_items
+      dseeley.tasks_serial.tasks_serial:
+        tasks:
+          - name: stop master service
+            ansible.builtin.service:
+              name: yugabyte-master
+              state: stopped
+              enabled: false
+            delegate_to: "{{ item.name }}"
+            become: true
+      with_items: "{{ redeploy_targets }}"
+      ignore_errors: true
+      throttle: 1
+      register: r__nested_service
+
+    - name: verify service module ran and reported init-system detection failure
+      ansible.builtin.assert:
+        that:
+          - r__nested_service.results | length == 2
+          - "'yugabyte-master: host' in r__nested_service.results[0].results[0].msg"
+          - "'yugabyte-master: host' in r__nested_service.results[1].results[0].msg"
+
 - name: tasks_serial | multiple hosts with throttle
   hosts: serial_hosts
   gather_facts: false

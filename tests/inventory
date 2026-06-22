@@ -4,3 +4,7 @@ localhost ansible_connection=local
 [serial_hosts]
 serial_a ansible_connection=local
 serial_b ansible_connection=local
+
+# SSH stub used only by delegate_to connection tests (unreachable by design).
+[delegate_ssh_hosts]
+serial_ssh ansible_connection=ssh ansible_host=10.255.255.254 ansible_ssh_common_args='-o ConnectTimeout=1'
